@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import time
 import uuid
 import requests
@@ -59,11 +60,20 @@ class Spider(BaseSpider):
         self.session_id = uuid.uuid4().hex
         self.device_id = self.session_id
         self.token = ""
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", "Accept": "*/*", "Origin": self.host, "Referer": self.host + "/home", "Content-Type": "application/octet-stream"}
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "Origin": self.host,
+            "Referer": self.host + "/home",
+            "Content-Type": "application/octet-stream"
+        }
         self.session = requests.Session()
         self.session.headers.update(self.headers)
         self.class_cache = None
         self.filter_cache = {}
+        # 代理缓存
+        self.proxy_cache = {}
+        self._proxy_seq = 0
 
     def init(self, extend=""):
         if extend:
@@ -75,8 +85,23 @@ class Spider(BaseSpider):
                 self.headers["Origin"] = self.host
                 self.headers["Referer"] = self.host + "/home"
                 self.session.headers.update(self.headers)
+                # 代理配置
+                proxy = cfg.get('proxy')
+                if proxy:
+                    if isinstance(proxy, str):
+                        if not proxy.startswith('http'):
+                            proxy = 'http://' + proxy
+                        self.session.proxies = {'http': proxy, 'https': proxy}
+                    elif isinstance(proxy, dict):
+                        p = {}
+                        for k, v in proxy.items():
+                            if k in ('http', 'https') and v:
+                                if not v.startswith('http'):
+                                    v = 'http://' + v
+                                p[k] = v
+                        self.session.proxies = p if p else None
             except Exception:
-                None
+                pass
 
     def getName(self):
         return self.name
@@ -128,7 +153,21 @@ class Spider(BaseSpider):
                 play.append("%s$%s|%s" % (ep.get("name") or ep.get("title") or "第%s集" % seq, vod_id, seq))
         else:
             play = ["第%s集$%s|%s" % (i, vod_id, i) for i in range(1, count + 1)]
-        vod = {"vod_id": vod_id, "vod_name": name, "vod_pic": self._pic(data), "type_name": data.get("category") or data.get("type") or "", "vod_year": "", "vod_area": "", "vod_remarks": data.get("update_label") or "全%s集" % count, "vod_actor": "", "vod_director": "", "vod_content": data.get("description") or data.get("summary") or name, "vod_play_from": self.name, "vod_play_url": "#".join(play)}
+        desc = data.get("description") or data.get("summary") or data.get("intro") or name
+        vod = {
+            "vod_id": vod_id,
+            "vod_name": name,
+            "vod_pic": self._proxy_url(self._pic(data)),  # 图片走代理
+            "type_name": data.get("category") or data.get("type") or "",
+            "vod_year": "",
+            "vod_area": "",
+            "vod_remarks": data.get("update_label") or "全%s集" % count,
+            "vod_actor": "",
+            "vod_director": "",
+            "vod_content": desc,
+            "vod_play_from": self.name,
+            "vod_play_url": "#".join(play)
+        }
         return {"list": [vod], "parse": 0, "jx": 0}
 
     def searchContent(self, key, quick, pg="1"):
@@ -140,8 +179,118 @@ class Spider(BaseSpider):
         vid, seq = self._split(id)
         obj = self._api("/drama/play", {"id": vid, "seq": str(seq)}, True)
         data = obj.get("data", {}) if isinstance(obj, dict) else {}
-        url = data.get("m3u8") or data.get("url") or self._hls(vid, seq)
-        return {"parse": 0, "playUrl": "", "url": url, "jx": 0, "header": {"User-Agent": self.headers["User-Agent"], "Referer": self.host + "/home", "Origin": self.host}}
+        url = data.get("m3u8") or data.get("url")
+        if not url:
+            url = self._hls(vid, seq)
+        # 播放地址走代理
+        play_url = self._proxy_url(url)
+        play_header = {
+            "User-Agent": self.headers["User-Agent"],
+            "Referer": self.host + "/home",
+            "Origin": self.host,
+            "Accept": "*/*"
+        }
+        return {
+            "parse": 0,
+            "playUrl": "",
+            "url": play_url,
+            "jx": 0,
+            "header": play_header,
+            "headers": play_header,
+            "format": "application/x-mpegURL"  # 关键：加上 format 字段
+        }
+
+    def _proxy_url(self, target_url):
+        if not target_url:
+            return target_url
+        self._prune_proxy_cache()
+        self._proxy_seq += 1
+        key = f'{int(time.time() * 1000)}_{self._proxy_seq}'
+        self.proxy_cache[key] = {'url': target_url, 'expires': time.time() + 3600}
+        return f'http://127.0.0.1:9978/proxy?do=py&type=proxy&key={key}'
+
+    def _prune_proxy_cache(self):
+        now = time.time()
+        for k in [k for k, v in self.proxy_cache.items() if v.get('expires', 0) < now]:
+            self.proxy_cache.pop(k, None)
+
+    def localProxy(self, params):
+        if params.get('do') != 'py' or params.get('type') != 'proxy':
+            return None
+        key = params.get('key', '')
+        item = self.proxy_cache.get(key)
+        if not item or item.get('expires', 0) < time.time():
+            return [404, 'text/plain', '缓存过期']
+        item['expires'] = time.time() + 3600
+        target_url = item.get('url', '')
+        try:
+            req_headers = {
+                'User-Agent': self.headers.get('User-Agent', ''),
+                'Accept': '*/*',
+                'Origin': self.host,
+                'Referer': self.host + '/home',
+            }
+            rng = params.get('range') or params.get('Range')
+            if rng:
+                req_headers['Range'] = rng
+            r = self.session.get(target_url, headers=req_headers, stream=True, timeout=30)
+            ctype = r.headers.get('content-type', 'application/octet-stream')
+            data = r.content
+            # 判断 m3u8
+            is_m3u8 = (target_url.split('?')[0].endswith('.m3u8') or 
+                       'mpegurl' in ctype.lower() or 
+                       (data and len(data) > 7 and data[:7] == b'#EXTM3U'))
+            if is_m3u8:
+                try:
+                    text = data.decode('utf-8')
+                except:
+                    text = data.decode('utf-8', errors='ignore')
+                new_text = self._rewrite_m3u8(text, target_url)
+                body = new_text.encode('utf-8')
+                return [200, 'application/vnd.apple.mpegurl', body, {
+                    'Content-Type': 'application/vnd.apple.mpegurl',
+                    'Content-Length': str(len(body)),
+                    'Cache-Control': 'no-cache'
+                }]
+            # 非 m3u8 透传
+            resp_headers = {
+                'Content-Type': ctype,
+                'Accept-Ranges': 'bytes',
+                'Cache-Control': 'no-cache'
+            }
+            if r.headers.get('content-range'):
+                resp_headers['Content-Range'] = r.headers['content-range']
+            if r.headers.get('content-length'):
+                resp_headers['Content-Length'] = r.headers['content-length']
+            return [r.status_code, ctype, data, resp_headers]
+        except Exception as e:
+            return [500, 'text/plain', f'代理失败: {str(e)}']
+
+    def _rewrite_m3u8(self, text, base_url):
+        from urllib.parse import urljoin
+        out = []
+        for line in (text or '').splitlines():
+            s = line.strip()
+            if not s:
+                out.append(line)
+                continue
+            if s.startswith('#'):
+                out.append(self._rewrite_tag(line, base_url))
+                continue
+            absolute = urljoin(base_url, s)
+            out.append(self._proxy_url(absolute))
+        return '\n'.join(out) + '\n'
+
+    def _rewrite_tag(self, line, base_url):
+        from urllib.parse import urljoin
+        import re
+        def rep(m):
+            raw = m.group(1)
+            if raw.startswith('http://127.0.0.1:9978/'):
+                return m.group(0)
+            absolute = urljoin(base_url, raw)
+            return f'URI="{self._proxy_url(absolute)}"'
+        return re.sub(r'URI="([^"]+)"', rep, line)
 
     def _api(self, path, data=None, silent=False):
         path = "/" + path.lstrip("/")
@@ -153,12 +302,25 @@ class Spider(BaseSpider):
         ts = int(time.time())
         sign = hashlib.sha256(("Dart|%s|%s|%s|%s" % (self.session_id, rid, ts, path)).encode("utf-8")).hexdigest() + "-" + str(ts)
         h = dict(self.headers)
-        h.update({"version": self.version, "deviceType": self.device_type, "time": str(ts), "sign": sign, "requestId": rid, "sessionId": self.session_id, "deviceBrand": "", "deviceModel": "", "systemName": "", "systemVersion": ""})
+        h.update({
+            "version": self.version,
+            "deviceType": self.device_type,
+            "time": str(ts),
+            "sign": sign,
+            "requestId": rid,
+            "sessionId": self.session_id,
+            "deviceBrand": "",
+            "deviceModel": "",
+            "systemName": "",
+            "systemVersion": ""
+        })
         try:
             r = self.session.post(self.api + path, data=body, headers=h, timeout=20, verify=False)
             r.raise_for_status()
             return self._decode(r.content, rid)
-        except Exception:
+        except Exception as e:
+            if not silent:
+                print("API error %s: %s" % (path, e), file=sys.stderr)
             return {}
 
     def _key(self, rid):
@@ -189,7 +351,10 @@ class Spider(BaseSpider):
         return arr
 
     def _filters(self, classes):
-        common = [{"key": "order", "name": "排序", "value": [{"n": "默认", "v": ""}, {"n": "最新", "v": "new"}, {"n": "最热", "v": "hot"}]}, {"key": "update_status", "name": "状态", "value": [{"n": "全部", "v": ""}, {"n": "连载", "v": "0"}, {"n": "完结", "v": "1"}]}]
+        common = [
+            {"key": "order", "name": "排序", "value": [{"n": "默认", "v": ""}, {"n": "最新", "v": "new"}, {"n": "最热", "v": "hot"}]},
+            {"key": "update_status", "name": "状态", "value": [{"n": "全部", "v": ""}, {"n": "连载", "v": "0"}, {"n": "完结", "v": "1"}]}
+        ]
         fs = {}
         for c in classes:
             tid = c["type_id"]
@@ -232,10 +397,15 @@ class Spider(BaseSpider):
         item = item or {}
         vid = self._sid(item.get("id") or item.get("drama_id") or "")
         remarks = item.get("update_label") or item.get("corner") or ("全%s集" % item.get("episode_count") if item.get("episode_count") else "")
-        return {"vod_id": vid, "vod_name": item.get("name") or item.get("title") or item.get("t") or vid, "vod_pic": self._pic(item), "vod_remarks": remarks}
+        return {
+            "vod_id": vid,
+            "vod_name": item.get("name") or item.get("title") or item.get("t") or vid,
+            "vod_pic": self._proxy_url(self._pic(item)),  # 图片走代理
+            "vod_remarks": remarks
+        }
 
     def _pic(self, item):
-        return item.get("img_y") or item.get("img_x") or item.get("img") or item.get("cover") or item.get("pic") or ""
+        return item.get("img_x") or item.get("img") or item.get("img_y") or item.get("cover") or item.get("pic") or ""
 
     def _unlock(self, d):
         eps = d.get("episodes")
@@ -246,7 +416,17 @@ class Spider(BaseSpider):
                     ep["type"] = "free"
                     ep["price"] = 0
                     ep["methods"] = []
-        d.update({"pay_type": "free", "money": 0, "episode_price": 0, "points_price": 0, "can_vip_watch": True, "is_buy_whole": True, "vip_episodes": [], "coin_episodes": [], "points_episodes": []})
+        d.update({
+            "pay_type": "free",
+            "money": 0,
+            "episode_price": 0,
+            "points_price": 0,
+            "can_vip_watch": True,
+            "is_buy_whole": True,
+            "vip_episodes": [],
+            "coin_episodes": [],
+            "points_episodes": []
+        })
         return d
 
     def _sid(self, x):
